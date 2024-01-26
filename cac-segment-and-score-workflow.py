@@ -1,215 +1,196 @@
-import os
-import time
-import torch
+from scipy import ndimage
 import numpy as np
-from monai.networks.nets import SegResNetVAE, UNet
-from monai.networks.layers import Norm
-from monai.data import Dataset, DataLoader, decollate_batch
-from monai.data.utils import pad_list_data_collate
-from monai.transforms import (
-	LoadImaged,
-	EnsureChannelFirstd,
-	Spacingd,
-	ScaleIntensityRanged,
-	Compose,
-	AsDiscreted,
-	Invertd,
-	Activationsd,
-	Invert,
-	AsDiscrete,
-)
-from monai.metrics import DiceMetric
-from monai.inferers import sliding_window_inference
-from monai.handlers.utils import from_engine
-from calcium_scoring import get_all_calcium_scores, get_CVD_risk_category
-import csv
 
-device = torch.device("cuda:3")
+# ref: https://github.com/qurAI-amsterdam/calcium-scoring/blob/main/src/calciumscoring/scores.py
 
-configs = {'cac_labels': {1:"LM", 2:"LAD", 3:"LCx", 4:"RCA", 5:"other"}}
+def get_all_calcium_scores(
+		image, spacing, label,
+		cac_label_names=None, 
+		min_vol=None, max_vol=None,
+		verbose=False
+	):
 
 
-## OUTPUT FILE
-output_file = open("CAC_result_test_240115.csv", "w")
-writer = csv.writer(output_file)
-writer.writerow(["Model tested: CAC_UNet_230820-002"])
+	result = dict()
 
-writer.writerow(["Series Name", "No. of slice", "Slice thickness(mm)"] + [str(key)+" seg. dice" for key in ["LM", "LAD", "LCx", "RCA"]] 
-	+ [str(key) + ' CAC score' for key in ['total', "LM", "LAD", "LCx", "RCA"]] + ['Risk category', 'Inference Time (s)'])
+	# total score
+	total_cac_label = (label>0).astype(int)
+	total_score = get_agatston_score(image, spacing, total_cac_label, min_vol, max_vol)
+	result["total"] = total_score
 
-## MODEL: PASTE THE DESIRED ARCHITECTURE & PATH
-model = UNet(
-	spatial_dims=3,
-	in_channels=1,
-	out_channels=6,
-	channels=(16, 32, 64, 128, 256),
-	strides=(2, 2, 2, 2),
-	num_res_units=2,
-	norm=Norm.BATCH,
-)
-model.load_state_dict(torch.load("/home/b09401064/CAC/models/CAC_UNet_230820-002_best.pth"))
-model.to(device)
-model.eval()
+	if verbose:
+		# print(np.sum(total_cac_label), flush=True)
+		print("Total:", total_score, flush=True)
 
-model_struct = UNet(
-	spatial_dims=3,
-	in_channels=1,
-	out_channels=6,
-	channels=(16, 32, 64, 128, 256),
-	strides=(2, 2, 2, 2),
-	num_res_units=2,
-	norm=Norm.BATCH,
-)
-model_struct_name = "models/CAC_unet_struct_160_20221224.pth"
-print("struct model: "+model_struct_name, flush=True)
-model_struct.load_state_dict(torch.load(model_struct_name))
-model_struct.to(device)
-model_struct.eval()
+	# vessel-specific scores
+	score_sum = 0.0 # for debug
 
-## DATASET: PASTE THE DESIRED DIRECTORY
-data_dir = "/data/b09401064/CAC_DATASET_ACL/"
-data_list = []
-def condition(file):
-	pt_id = file.split(".")[0].split("-")[1]
-	if pt_id in ['0010', '0011', '0012', '0017', '0020', '0022', '0027', '0029', '0038', '0042', '0050', '0051', '0054', '0056', '0062',
-	'0064', '0065']: return True
-	return False
+	if cac_label_names is not None:
+		for key in cac_label_names.keys():
+			ves_spe_label = (label==key).astype(int)
+			ves_spe_score = get_agatston_score(image, spacing, ves_spe_label, min_vol, max_vol)
+			result[cac_label_names[key]] = ves_spe_score
 
-for file in os.listdir(data_dir+"labels/"):
-	if os.path.exists(data_dir+"images/"+file) and condition(file):
-		data_list.append({
-			"image-name": file,
-			"image": os.path.join(data_dir, "images", file),
-			"image-ori": os.path.join(data_dir, "images", file),
-			"label": os.path.join(data_dir, "labels", file)
-		})
+			if verbose: 
+				# print(np.sum(ves_spe_label), flush=True)
+				print(f"{cac_label_names[key]}: {ves_spe_score}", flush=True)
 
-transforms = Compose([
-	LoadImaged(keys=("image", "label", "image-ori")),
-	EnsureChannelFirstd(keys=("image", "label")),
-	Spacingd(keys=("image"), pixdim=(1.0, 1.0, 1.0), mode=("bilinear")),
-	ScaleIntensityRanged(keys=("image"), a_min=-300, a_max=300, b_min=0.0, b_max=1.0, clip=True)
-])
-post_transforms = Compose([
-	Invertd(
-		keys=("struct","pred"),
-		transform=transforms,
-		orig_keys="image",
-		meta_keys=("struct_meta_dict", "pred_meta_dict"),
-		orig_meta_keys="image_meta_dict",
-		meta_key_postfix="meta_dict",
-		nearest_interp=True,
-		to_tensor=True,
-	),
-	Activationsd(keys=("struct", "pred"), sigmoid=True), 
-	AsDiscreted(keys="label", to_onehot=6), # PASTE THE DESIGNED NUMBER OF LABELS OF THE MODEL
-])
+			score_sum += ves_spe_score # for debug
 
-dataset = Dataset(data=data_list, transform=transforms)
-dataloader = DataLoader(dataset, batch_size=1, num_workers=1, collate_fn=pad_list_data_collate)
+		#for debug
+		if abs(score_sum - total_score) > 1:
+			print(f"Score wrong: sum = {score_sum}, != total score = {total_score}", flush=True)
 
-## METRICS SETUP
-dice_metric_case = DiceMetric(include_background=False, reduction="mean_batch")
+		result["total"] = total_score # ?
 
-all_tp = {key: 0 for key in configs['cac_labels'].values()}
-all_tp_fn = {key: 0 for key in configs['cac_labels'].values()}
-all_tp_fp = {key: 0 for key in configs['cac_labels'].values()}
+	return result
 
-## TESTING LOOP
-with torch.no_grad():
-	for data in dataloader:
-		data_name = data["image-name"][0].split(".")[0]
-		print(data_name, flush=True)
-		image, label, image_ori = (data["image"].to(device), data["label"], data["image-ori"])
-		image_shape = image_ori[0].shape
+def get_CVD_risk_category(agatston_score):
+	if agatston_score == 0:
+		return "very low"
+	elif agatston_score <= 10:
+		return "low"
+	elif agatston_score <= 100:
+		return "intermediate"
+	elif agatston_score <= 400:
+		return "high"
+	else:
+		return "very high"
 
-		start_time = time.time()
+def density_factor(maxHU):
+	if maxHU < 130:
+		return 0
+	if maxHU < 200:
+		return 1
+	if maxHU < 300:
+		return 2
+	if maxHU < 400:
+		return 3
+	return 4
 
-		roi_size_struct = (96, 96, 96)
-		sw_batch_size_struct = 1
-		data["struct"] = sliding_window_inference(image, roi_size_struct, sw_batch_size_struct, model_struct)
+def get_agatston_score(image, spacing, labels, min_vol = None, max_vol = None):
+	"""
+	Eliminate small lesions by lesion volume.
+	"""
 
-		roi_size = (96, 96, 96) # PASTE THE DESIGNED ROI SIZE OF THE MODEL
-		sw_batch_size = 1
-		data["pred"] = sliding_window_inference(image, roi_size, sw_batch_size, model)
-		data = [post_transforms(i) for i in decollate_batch(data)]
-		label, struct, output = from_engine(["label", "struct", "pred"])(data)
+	# Assume labels are binary masks in [x, y, z]
+	lesion_map, n_lesion = ndimage.label(labels, ndimage.generate_binary_structure(3,3))
+	print(n_lesion, "lesion(s)", flush=True)
+	agatston_score = 0.0
+	# volume_score = 0.0
 
-		# DEBUG
-		# print(image.shape, label[0].shape, output[0].shape, image_ori.shape, struct[0].shape, flush=True)
-		# torch.Size([1, 1, 200, 200, 127]) torch.Size([6, 512, 512, 43]) torch.Size([6, 512, 512, 43]) torch.Size([1, 512, 512, 43]) torch.Size([6, 512, 512, 43])
+	for lesion_num in range(1, n_lesion+1):
+		lesion_mask = (lesion_map == lesion_num).astype(int)
+		lesion_volume = np.sum(lesion_mask)
 
-		struct_result = np.argmax(struct[0], axis=0).astype(int)
-		heart_mask = (struct_result==1).astype(int)
-		# print(np.sum(heart_mask), flush=True)
+		if min_vol is not None and lesion_volume < min_vol:
+			continue
+		if max_vol is not None and lesion_volume > max_vol:
+			continue
 
-		n_labels = 5
-		cac_result = np.zeros((n_labels+1, image_shape[0], image_shape[1], image_shape[2]))
-		pred_class = np.argmax(output[0][1:], axis=0) + 1
-		for i in range(0, n_labels+1):
-			cac_result[i] = (pred_class == i).astype(int) * (image_ori[0] >= 130).astype(int) * heart_mask
-		cac_result = torch.tensor(np.stack([cac_result]))
-		
-		end_time = time.time()
+		# volume_score += lesion_volume
 
-		dice_metric_case(y_pred=cac_result, y=label) # include_background = False -> channel 0 (BG) is ignored
-		dice_list = [item.item() for item in dice_metric_case.aggregate()]
-		print(dice_list, flush=True)
-		dice_metric_case.reset()
+		lesion_score = 0.0
+		slices_num = sorted(np.unique(np.where(lesion_mask==1)[2]))
+		for z in slices_num:
+			area = np.sum(lesion_mask[:, :, z])
+			maxHU = np.max(image[:, :, z] * lesion_mask[:, :, z])
+			lesion_score += area * density_factor(maxHU)
+		# print(lesion_score, flush=True)
+			
+		agatston_score += lesion_score
 
-		cac_result = cac_result.numpy()
-		for i in range(1,n_labels+1):
-			tp_fn = np.sum(label[0][i])
-			tp_fp = np.sum(cac_result[0][i])
-			tp = np.sum(label[0][i] * cac_result[0][i])
+	agatston_score *= spacing[0] * spacing[1] * spacing[2]/3.0
+	# volume_score *= spacing[0] * spacing[1] * spacing[2]
+	# density_score = agatston_score / volume_score * spacing[2]
 
-			print(f"{configs['cac_labels'][i]}: label = {tp_fn}, pred = {tp_fp}, intersect = {tp}; ", 
-				f"precision = {tp/tp_fp}, recall = {tp/tp_fn}, dice(f1) = {2*tp/(tp_fp+tp_fn)}", flush=True)
+	# print(agatston_score, volume_score, density_score, flush=True)
+	return agatston_score#, volume_score, density_score
 
-			all_tp[configs['cac_labels'][i]] += tp
-			all_tp_fn[configs['cac_labels'][i]] += tp_fn
-			all_tp_fp[configs['cac_labels'][i]] += tp_fp
-
-		affine = image_ori[0].affine
-		spacing = [abs(affine[i][i].item()) for i in range(3)]
-		print(spacing, flush=True)
-		argmax_cac_result = np.argmax(cac_result[0][:-1], axis=0)
-		argmax_cac_result *= (argmax_cac_result<5).astype(int) # remove other 
-		print(argmax_cac_result.shape, flush=True)
-		result = get_all_calcium_scores(image_ori[0], spacing, argmax_cac_result,
-			cac_label_names={1:"LM", 2:"LAD", 3:"LCx", 4:"RCA"}, min_vol=3)
-		print(result, flush=True)
-		risk = get_CVD_risk_category(result["total"])
-		print(risk, flush=True)
-
-		writer.writerow([data_name, image_shape[2], spacing[2]] + dice_list[:-1] + list(result.values()) + [risk, end_time-start_time])
+def get_all_calcium_scores_vote(
+		image, spacing, label,
+		cac_label_names, 
+		min_vol=None, max_vol=None,
+		verbose=False
+	):
 
 
-print(f"Overall (Flattened):", flush=True)
-writer.writerows([[],['Flattened'], ['Vessel', 'Precision', "Recall", "Dice (F1)"]])
+	result = dict()
 
-total_tp, total_tp_fp, total_tp_fn = 0, 0, 0
+	# total score
+	total_cac_label = (label>0).astype(int)
+	ves_label = {i: (label==i).astype(int) for i in cac_label_names.keys()}
+	ves_score = {i: 0 for i in cac_label_names.keys()}
 
-for key in ["LM", "LAD", "LCx", "RCA"]:
-	precision = all_tp[key]/all_tp_fp[key]
-	recall = all_tp[key]/all_tp_fn[key]
-	dice = all_tp[key]*2/(all_tp_fn[key]+all_tp_fp[key])
+	lesion_map, n_lesion = ndimage.label(total_cac_label, ndimage.generate_binary_structure(3,3))
 
-	print(f"{key}: precision = {precision}, recall = {recall}, dice = {dice}", flush=True)
-	total_tp += all_tp[key]
-	total_tp_fn += all_tp_fn[key]
-	total_tp_fp += all_tp_fp[key]
+	for lesion_num in range(1, n_lesion+1):
+		lesion_mask = (lesion_map == lesion_num).astype(int)
+		lesion_volume = np.sum(lesion_mask)
 
-	writer.writerow([key, precision, recall, dice])
+		if min_vol is not None and lesion_volume < min_vol:
+			continue
+		if max_vol is not None and lesion_volume > max_vol:
+			continue
 
-precision = total_tp / total_tp_fp
-recall = total_tp / total_tp_fn
-dice = total_tp*2/(total_tp_fn+total_tp_fp)
-print(f"Total: precision = {precision}, recall = {recall}, dice = {dice}", flush=True)
+		ves_spe_volume = {i: np.sum(lesion_mask * ves_label[i]) for i in cac_label_names.keys()}
+		max_ves = max(ves_spe_volume, key=ves_spe_volume.get)
 
-writer.writerow(["Total", precision, recall, dice])
+		lesion_score = 0.0
+		slices_num = sorted(np.unique(np.where(lesion_mask==1)[2]))
+		for z in slices_num:
+			area = np.sum(lesion_mask[:, :, z])
+			maxHU = np.max(image[:, :, z] * lesion_mask[:, :, z])
+			lesion_score += area * density_factor(maxHU)
+		# print(lesion_score, flush=True)
+			
+		ves_score[max_ves] += lesion_score
 
-output_file.close()
+	for i in ves_score.keys():
+		result[cac_label_names[i]] = ves_score[i] * spacing[0] * spacing[1] * spacing[2]/3.0
 
+	total_cac_score = sum(result.values())
+	result['total'] = total_cac_score
 
+	return result
 
+def get_all_calcium_scores_onehot(
+		image, spacing, label_onehot,
+		cac_label_names, 
+		min_vol=None, max_vol=None,
+		verbose=False
+	):
+
+	result = dict()
+
+	# total score
+	total_cac_label = (np.argmax(label_onehot, axis=0)>0).astype(int)
+	total_score = get_agatston_score(image, spacing, total_cac_label, min_vol, max_vol)
+	result["total"] = total_score
+
+	if verbose:
+		# print(np.sum(total_cac_label), flush=True)
+		print("Total:", total_score, flush=True)
+
+	# vessel-specific scores
+	score_sum = 0.0 # for debug
+
+	if cac_label_names is not None:
+		for key in cac_label_names.keys():
+			ves_spe_label = label_onehot[key]
+			ves_spe_score = get_agatston_score(image, spacing, ves_spe_label, min_vol, max_vol)
+			result[cac_label_names[key]] = ves_spe_score
+
+			if verbose: 
+				# print(np.sum(ves_spe_label), flush=True)
+				print(f"{cac_label_names[key]}: {ves_spe_score}", flush=True)
+
+			score_sum += ves_spe_score # for debug
+
+		#for debug
+		if abs(score_sum - total_score) > 1:
+			print(f"Score wrong: sum = {score_sum}, != total score = {total_score}", flush=True)
+
+		result["total"] = total_score # ?
+
+	return result
