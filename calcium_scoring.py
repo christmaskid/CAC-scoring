@@ -129,7 +129,7 @@ def get_agatston_score_2(image, spacing, labels, min_vol = None, max_vol = None)
 
 	for z in range(image.shape[2]):
 		img_slice = image[:, :, z]
-		lbl_slice  labels[:, :, z]
+		lbl_slice = labels[:, :, z]
 		lesion_map, n_lesion = ndimage.label(lbl_slice, ndimage.generate_binary_structure(2,2))
 
 		for lesion_num in range(1, n_lesion+1):
