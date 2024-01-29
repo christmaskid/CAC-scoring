@@ -40,7 +40,7 @@ def get_all_calcium_scores(
 			score_sum += ves_spe_score # for debug
 
 		#for debug
-		if abs(score_sum - total_score) > 1:
+		if verbose==True and abs(score_sum - total_score) > 1:
 			print(f"Score wrong: sum = {score_sum}, != total score = {total_score}", flush=True)
 
 		result["total"] = total_score # ?
@@ -112,33 +112,35 @@ def get_agatston_score(image, spacing, labels, min_vol = None, max_vol = None):
 	# print(agatston_score, volume_score, density_score, flush=True)
 	return agatston_score#, volume_score, density_score
 
-def get_agatston_score_2(image, spacing, labels, min_area = None, max_area = None):
+def get_agatston_score_2(image, spacing, labels, min_vol = None, max_vol = None):
 	"""
 	Eliminate small lesions by lesion volume.
 	"""
-	# lesion_map, n_lesion = ndimage.label(labels, ndimage.generate_binary_structure(3,3))
-	# print(n_lesion, "lesion(s)", flush=True)
+	lesion_map, n_lesion = ndimage.label(labels, ndimage.generate_binary_structure(3,3))
+	print(n_lesion, "lesion(s)", flush=True)
+
+	for lesion_num in range(1, n_lesion+1):
+		lesion_mask = (lesion_map == lesion_num).astype(int)
+		if np.sum(lesion_mask) < min_vol:
+			lesion_map *= (1-lesion_mask).astype(int)
 
 	# Assume labels are binary masks in [x, y, z]
 	agatston_score = 0.0
 
 	for z in range(image.shape[2]):
 		img_slice = image[:, :, z]
-		lesion_map, n_lesion = ndimage.label(img_slice, ndimage.generate_binary_structure(2,2))
+		lbl_slice  labels[:, :, z]
+		lesion_map, n_lesion = ndimage.label(lbl_slice, ndimage.generate_binary_structure(2,2))
 
 		for lesion_num in range(1, n_lesion+1):
 			lesion_mask = (lesion_map == lesion_num).astype(int)
-			lesion_area= np.sum(lesion_mask)
-
-			if min_area is not None and lesion_area < min_area:
-				continue
-			if max_area is not None and lesion_volume > max_area:
-				continue
+			lesion_area = np.sum(lesion_mask)
+			# print(lesion_num, lesion_area, flush=True)
 
 			lesion_score = 0.0
 			maxHU = np.max(img_slice * lesion_mask)
 			lesion_score += lesion_area * density_factor(maxHU)
-			# print(lesion_score, flush=True)
+			# print(maxHU, lesion_score, flush=True)
 				
 			agatston_score += lesion_score
 
