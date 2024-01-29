@@ -1,7 +1,9 @@
 from scipy import ndimage
 import numpy as np
+import time
 
-# ref: https://github.com/qurAI-amsterdam/calcium-scoring/blob/main/src/calciumscoring/scores.py
+# ref:  https://github.com/qurAI-amsterdam/calcium-scoring/blob/main/src/calciumscoring/scores.py
+# ref2: https://github.com/AIM-Harvard/DeepCAC/blob/main/src/run_step4_cac_scoring.py
 
 def get_all_calcium_scores(
 		image, spacing, label,
@@ -15,7 +17,7 @@ def get_all_calcium_scores(
 
 	# total score
 	total_cac_label = (label>0).astype(int)
-	total_score = get_agatston_score(image, spacing, total_cac_label, min_vol, max_vol)
+	total_score = get_agatston_score_2(image, spacing, total_cac_label, min_vol, max_vol)
 	result["total"] = total_score
 
 	if verbose:
@@ -28,7 +30,7 @@ def get_all_calcium_scores(
 	if cac_label_names is not None:
 		for key in cac_label_names.keys():
 			ves_spe_label = (label==key).astype(int)
-			ves_spe_score = get_agatston_score(image, spacing, ves_spe_label, min_vol, max_vol)
+			ves_spe_score = get_agatston_score_2(image, spacing, ves_spe_label, min_vol, max_vol)
 			result[cac_label_names[key]] = ves_spe_score
 
 			if verbose: 
@@ -54,8 +56,10 @@ def get_CVD_risk_category(agatston_score):
 		return "intermediate"
 	elif agatston_score <= 400:
 		return "high"
-	else:
+	elif agatston_score <= 1000:
 		return "very high"
+	else:
+		return "extremely high"
 
 def density_factor(maxHU):
 	if maxHU < 130:
@@ -73,9 +77,10 @@ def get_agatston_score(image, spacing, labels, min_vol = None, max_vol = None):
 	Eliminate small lesions by lesion volume.
 	"""
 
+	start_time = time.time()
 	# Assume labels are binary masks in [x, y, z]
 	lesion_map, n_lesion = ndimage.label(labels, ndimage.generate_binary_structure(3,3))
-	print(n_lesion, "lesion(s)", flush=True)
+	# print(n_lesion, "lesion(s)", flush=True)
 	agatston_score = 0.0
 	# volume_score = 0.0
 
@@ -91,7 +96,7 @@ def get_agatston_score(image, spacing, labels, min_vol = None, max_vol = None):
 		# volume_score += lesion_volume
 
 		lesion_score = 0.0
-		slices_num = sorted(np.unique(np.where(lesion_mask==1)[2]))
+		slices_num = np.unique(np.where(lesion_mask==1)[2])
 		for z in slices_num:
 			area = np.sum(lesion_mask[:, :, z])
 			maxHU = np.max(image[:, :, z] * lesion_mask[:, :, z])
@@ -106,6 +111,44 @@ def get_agatston_score(image, spacing, labels, min_vol = None, max_vol = None):
 
 	# print(agatston_score, volume_score, density_score, flush=True)
 	return agatston_score#, volume_score, density_score
+
+def get_agatston_score_2(image, spacing, labels, min_area = None, max_area = None):
+	"""
+	Eliminate small lesions by lesion volume.
+	"""
+	# lesion_map, n_lesion = ndimage.label(labels, ndimage.generate_binary_structure(3,3))
+	# print(n_lesion, "lesion(s)", flush=True)
+
+	# Assume labels are binary masks in [x, y, z]
+	agatston_score = 0.0
+
+	for z in range(image.shape[2]):
+		img_slice = image[:, :, z]
+		lesion_map, n_lesion = ndimage.label(img_slice, ndimage.generate_binary_structure(2,2))
+
+		for lesion_num in range(1, n_lesion+1):
+			lesion_mask = (lesion_map == lesion_num).astype(int)
+			lesion_area= np.sum(lesion_mask)
+
+			if min_area is not None and lesion_area < min_area:
+				continue
+			if max_area is not None and lesion_volume > max_area:
+				continue
+
+			lesion_score = 0.0
+			maxHU = np.max(img_slice * lesion_mask)
+			lesion_score += lesion_area * density_factor(maxHU)
+			# print(lesion_score, flush=True)
+				
+			agatston_score += lesion_score
+
+	agatston_score *= spacing[0] * spacing[1] * spacing[2]/3.0
+	# volume_score *= spacing[0] * spacing[1] * spacing[2]
+	# density_score = agatston_score / volume_score * spacing[2]
+
+	# print(agatston_score, volume_score, density_score, flush=True)
+	return agatston_score#, volume_score, density_score
+
 
 def get_all_calcium_scores_vote(
 		image, spacing, label,
