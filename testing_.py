@@ -132,7 +132,7 @@ if configs['input_mode'] == "HU130":
 		ConcatItemsd(keys=("image","image_thres"),name="image"),
 	]
 else: 
-	load_transforms = +[
+	load_transforms += [
 		ScaleIntensityRanged(keys=image_keys, a_min=-300, a_max=300, b_min=0.0, b_max=1.0, clip=True)
 	]
 
