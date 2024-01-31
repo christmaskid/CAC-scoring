@@ -46,6 +46,7 @@ model_type = "" # PASTE model architecture type ("UNet", "UNETR", "SegResNetVAE"
 input_mode = "" # PASTE model input type ("only" (image only), "HU130" (add additional >130 mask), "with-cor-seg" (has coronary a. segmentation))
 os.environ["CUDA_VISIBLE_DEVICES"]="" # FILL IN gpu number(s)
 batch_size = 1
+use_struct_model = True
 
 # =================================== #
 
@@ -69,7 +70,7 @@ writer.writerow(["Series Name", "No. of slice", "Slice thickness(mm)"] + [str(ke
 
 # DEFINE CONFIGURATIONS
 configs = {
-	"roi_size": (256,256, 32),
+	"roi_size": (128, 128, 32),
 	#"roi_size": (96, 96, 96)
 	"cac_labels": {1: "LM", 2: "LAD", 3: "LCx", 4: "RCA", 5: "other"},
 	"train_batch_size": batch_size,
@@ -93,12 +94,18 @@ image_folder_name = "100筆影像" # "images"
 label_folder_name = "100筆標註" # "labels"
 for file in os.listdir(data_dir+label_folder_name+"/"):
 	if "CVAI-0151-20161130-1mm" in file: continue # discarded file
-	val_data_list.append({
-		"image-name": file,
+	item = {
+		"image-name": file.split('.')[0],
 		"image": os.path.join(data_dir, image_folder_name, file.split('.')[0]+'.nii.gz'),
 		"image-ori": os.path.join(data_dir, image_folder_name, file.split('.')[0]+'.nii.gz'),
 		"cac_label": os.path.join(data_dir, label_folder_name, file)
-	})
+	}
+	if use_struct_model:
+		item["image2"] = os.path.join(data_dir, image_folder_name, file.split('.')[0]+'.nii.gz'),
+	val_data_list.append(item)
+
+val_data_list = sorted(val_data_list, key=lambda x: x["image-name"])
+
 print(len(val_data_list), flush=True)
 print(val_data_list[0], flush=True)
 
@@ -107,22 +114,26 @@ print(val_data_list[0], flush=True)
 
 # DEFINE TRANSFORMS
 
+image_keys = ["image"]
+if use_struct_model:
+	image_keys += ["image2"]
+
+load_transforms = [
+		LoadImaged(keys=image_keys+["cac_label","image-ori"]),
+		EnsureChannelFirstd(keys=image_keys+["cac_label"])
+]
+
 if configs['input_mode'] == "HU130":
-	load_transforms = [
-		LoadImaged(keys=["image", "cac_label","image-ori"]),
-		EnsureChannelFirstd(keys=("image","cac_label")),
+	load_transforms += [
 		CopyItemsd(keys=("image"),names=["image_thres"]),
-		ScaleIntensityRanged(keys=["image"], a_min=-300, a_max=300, b_min=0.0, b_max=1.0, clip=True),
+		ScaleIntensityRanged(keys=image_keys, a_min=-300, a_max=300, b_min=0.0, b_max=1.0, clip=True),
 		ThresholdIntensityd(keys=("image_thres"),threshold=129),
 		ScaleIntensityRanged(keys=["image_thres"], a_min=20, a_max=100, b_min=0.0, b_max=1.0, clip=True),
 		ConcatItemsd(keys=("image","image_thres"),name="image"),
 	]
 else: 
-	load_transforms = [
-			LoadImaged(keys=data_keys),
-			EnsureChannelFirstd(keys=["image", "cac_label"]),
-			Spacingd(keys=data_keys, pixdim=(1.0, 1.0, 1.0), mode=spacing_modes),
-			ScaleIntensityRanged(keys=["image"], a_min=-300, a_max=300, b_min=0.0, b_max=1.0, clip=True)
+	load_transforms = +[
+		ScaleIntensityRanged(keys=image_keys, a_min=-300, a_max=300, b_min=0.0, b_max=1.0, clip=True)
 	]
 
 val_transforms = Compose(load_transforms)
@@ -135,6 +146,11 @@ post_pred = Compose([
 post_label = Compose([
 	ToTensor(),
 	AsDiscrete(to_onehot=configs['num_labels']+1)])
+
+if use_struct_model:
+	post_struct = Compose([
+		Activations(sigmoid=True), 
+	])
 
 
 # =================================== #
@@ -193,10 +209,27 @@ if model is None:
 
 device = torch.device("cuda:0")
 
-model = nn.DataParallel(model)
+if "dict" in model_name:
+	model = nn.DataParallel(model)
 model.load_state_dict(torch.load(model_name))
 model.to(device)
 model.eval()
+
+if use_struct_model:
+	model_struct = UNet(
+		spatial_dims=3,
+		in_channels=1,
+		out_channels=6,
+		channels=(16, 32, 64, 128, 256),
+		strides=(2, 2, 2, 2),
+		num_res_units=2,
+		norm=Norm.BATCH,
+	)
+	model_struct_name = "models/CAC_unet_struct_160_20221224.pth"
+	print("struct model: "+model_struct_name, flush=True)
+	model_struct.load_state_dict(torch.load(model_struct_name))
+	model_struct.to(device)
+	model_struct.eval()
 
 # =================================== #
 
@@ -226,6 +259,8 @@ with torch.no_grad():
 
 		start_time = time.time()
 
+		# ===================# 
+		
 		if configs['input_mode'] == "with-cor-seg":
 			val_inputs, val_labels, val_add_inputs = (
 				val_data["image"].to(device),
@@ -234,13 +269,17 @@ with torch.no_grad():
 			)
 			new_val_inputs = torch.cat((val_inputs, val_add_inputs[:, 1:, :, :, :]), dim=1)
 		else:
-			val_inputs, val_labels ,image_ori= (
+			val_inputs, val_labels ,image_ori = (
 				val_data["image"].to(device),
 				val_data["cac_label"].to(device),
 				val_data["image-ori"].to(device),
 			)
 			new_val_inputs = val_inputs
+		if use_struct_model:
+			val_inputs2 = val_data["image2"].to(device)
 
+		# ===================# 
+		
 		image_shape = image_ori[0].shape
 		roi_size = configs['roi_size']
 		sw_batch_size = 4
@@ -253,18 +292,36 @@ with torch.no_grad():
 		val_outputs = [post_pred(i) for i in decollate_batch(val_outputs)]
 		val_labels = [post_label(i) for i in decollate_batch(val_labels)]
 
-		affine = image_ori[0].affine
-		spacing = [abs(affine[i][i].item()) for i in range(3)]
+		# ===================# 
+		
+		if use_struct_model:
+			val_structs = sliding_window_inference(val_inputs2, (96, 96, 96), 4, model_struct)
+			val_structs = [post_struct(i) for i in decollate_batch(val_structs)]
+
+			struct_result = np.argmax(val_structs[0], axis=0).astype(int)
+			struct_mask = (struct_result==1).astype(int) #+ (struct_result==2).astype(int)
+			HU_mask = (image_ori[0] >= 130).astype(int) 
+			heart_mask = (struct_mask>0).astype(int) * HU_mask
+
+			pred_class = np.argmax(val_outputs[0][1:5+1], axis=0) + 1
+			for i in range(0, 5+1):
+				val_outputs[0][i] = torch.Tensor((pred_class == i).astype(int) * heart_mask)
+
+		# ===================# 
 
 		argmax_cac_result = np.argmax(val_outputs[0][1:5+1], axis=0)
 		argmax_cac_result *= (argmax_cac_result<5).astype(int) # remove other 
-
+		
 		mid_time = time.time()
 
+		affine = image_ori[0].affine
+		spacing = [abs(affine[i][i].item()) for i in range(3)]
 		result = get_all_calcium_scores(image_ori[0], spacing, argmax_cac_result,
 			cac_label_names={1:"LM", 2:"LAD", 3:"LCx", 4:"RCA"}, min_vol=3)
 		risk = get_CVD_risk_category(result["total"])
 
+		# ===================# 
+		
 		end_time = time.time()
 
 		dice_metric(y_pred=val_outputs, y=val_labels)
@@ -289,6 +346,8 @@ with torch.no_grad():
 			all_tp_fn[configs['cac_labels'][i]] += tp_fn
 			all_tp_fp[configs['cac_labels'][i]] += tp_fp
 
+		# ===================# 
+		
 		left_pred = np.sum(val_outputs[0][1:3+1], axis=0)
 		left_label = np.sum(val_labels[0][1:3+1], axis=0)
 		print(left_pred.shape, left_label.shape, flush=True)
@@ -297,15 +356,21 @@ with torch.no_grad():
 		all_left_tp_fn += left_tp_fn
 		all_left_tp_fp += left_tp_fp
 
+		# ===================# 
+		
 		print(argmax_cac_result.shape, flush=True)
 		print(spacing, flush=True)
 		print(result, flush=True)
 		print(risk, flush=True)
 		print("time:", end_time - start_time, f"({mid_time - start_time} + {end_time - mid_time}) (s)", flush=True)
 
+		# ===================# 
+		
 		writer.writerow([data_name, image_shape[2], spacing[2]] + dice_list[:-1] + list(result.values()) 
 			+ [risk, end_time-start_time, mid_time-start_time, end_time-mid_time])
 
+		# ===================# 
+		
 		# get+=1
 		# if get == 1:
 			# nib.save(nib.Nifti1Image(val_inputs[0].cpu().numpy(),val_inputs[0].affine.cpu().numpy()),"output_img.nii.gz")
