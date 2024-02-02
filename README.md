@@ -19,6 +19,7 @@
   
 * ```testing_.py```: 完整testing，可設定不同transform、包含或不包含structural mask。
 * ```cac-segment-and-scoring-workflow.py```: 舊版完整testing，包含structural mask。
+* ```cac-validation.py```: for segmentation validation only.
 
 ## tools
 * ```calcium_scoring.py```: 主要使用 ```get_all_calcium_scores()``` 。
