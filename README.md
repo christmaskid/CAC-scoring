@@ -16,10 +16,12 @@
 * Example usage:
   
   ```python testing_save.py 231228-001 SegResNetVAE HU130 /home/student/exercise/CAC_SegResNetVAE_SegResNetVAE-231228-001_chosen_dict.pth CAC_result_test_231228-001_testing_min0_save.csv 6 False "[(1,2,3),(1,2,3,4)]" None False 0 "(256,256,32)```
+
+* ```testing-cac-scoring-only.py```: 用於 external validation set，for calcium scoring validation only。
+* ```testing-cac-segmentation-only.py```: for segmentation validation only.
   
 * ```testing_.py```: 完整testing，可設定不同transform、包含或不包含structural mask。
 * ```cac-segment-and-scoring-workflow.py```: 舊版完整testing，包含structural mask。
-* ```cac-validation.py```: for segmentation validation only.
 
 ## tools
 * ```calcium_scoring.py```: 主要使用 ```get_all_calcium_scores()``` 。
